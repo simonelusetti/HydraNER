@@ -1,0 +1,125 @@
+defaults:
+  - _self_
+
+selector_model:
+  threshold: 0.5
+  sbert_name: "sentence-transformers/all-MiniLM-L6-v2"
+  loss:
+    l_comp: 0.1
+    l_s: 0.01
+    l_tv: 10.0
+    tau: 0.07
+  optim:
+    lr: 5e-5
+    weight_decay: 1e-2
+    betas: [0.9, 0.999]
+
+expert_model:
+  sbert_name: "sentence-transformers/all-MiniLM-L6-v2"
+  contrastive_tau: 0.07
+  expert:
+    num_experts: 2
+    routing: "softmax"
+    routing_tau: 1.0
+    normalize: True
+    dropout: 0.0
+    factor_dim: 384
+    factor_hidden: 0
+    gate_hidden: 0
+    gate_dropout: 0.0
+    shared_transform: True
+    transform_dropout: 0.0
+    reconstruction_hidden: 0
+    use_token_decoder: False
+    decoder_hidden: 384
+    use_balance: True
+    use_diversity: True
+    use_continuity: True
+    use_attention: False
+    attention_heads: 4
+    attention_dropout: 0.0
+  loss_weights:
+    sent: 1.0
+    token: 1.0
+    entropy: 0.01
+    overlap: 0.01
+    continuity: 0.01
+    diversity: 0.01
+    balance: 0.01
+    attention: 0.0
+  optim:
+    lr: 5e-5
+    weight_decay: 1e-2
+    betas: [0.9, 0.999]
+
+train:
+  selector_threshold: 0.5
+  num_stages: 5
+  stage_epochs: [5, 5, 5, 5, 5]
+  loss_weights:
+    selector: 1.0
+    expert: 1.0
+  epochs: 10
+  grad_clip: 1.0
+
+data:
+  rebuild_ds: False
+  train:
+    dataset: "wikiann"
+    config: "en"
+    batch_size: 32
+    num_workers: 0
+    subset: 1.0
+    shuffle: True
+  eval:
+    dataset: "wikiann"
+    config: "en"
+    split: "validation"
+    batch_size: 32
+    num_workers: 0
+    subset: 1.0
+    shuffle: False
+  dev:
+    dataset: "wikiann"
+    config: "en"
+    split: "test"
+    batch_size: 32
+    num_workers: 0
+    subset: 1.0
+    shuffle: False
+
+eval:
+  eval_only: False
+
+runtime:
+  num_threads: 8
+
+device: "cuda"
+
+logging:
+  metrics_only: False
+
+array: 0
+
+dora:
+  exclude: ["eval.*", "data.rebuild_ds", "logging.*"]
+
+slurm:
+  partition: "boost_usr_prod"
+  gpus: 1
+  mem_per_gpu: 32
+  time: 240
+  cpus_per_gpu: 8
+  setup:
+    - "module load python/3.11.7"
+    - "source /leonardo/home/userexternal/slusetti/MoE/.venv/bin/activate"
+    - "export SLURM_CPU_BIND=none"
+    - "export HF_HOME=/leonardo_work/IscrC_LUSE/slusetti/hf-cache"
+    - "export HF_DATASETS_CACHE=$HF_HOME/datasets"
+    - "export TRANSFORMERS_CACHE=$HF_HOME/transformers"
+    - "export HF_MODULES_CACHE=$HF_HOME/modules"
+    - "export HF_HUB_CACHE=$HF_HOME/hub"
+    - "export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub"
+    - "export HF_HUB_OFFLINE=1"
+    - "export TRANSFORMERS_OFFLINE=1"
+    - "export HF_DATASETS_OFFLINE=1"
