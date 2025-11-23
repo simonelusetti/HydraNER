@@ -51,7 +51,12 @@ class RationaleSelectorModel(nn.Module):
 
     def forward(self, embeddings, attention_mask):
         alpha, beta = self.selector(embeddings)
-        g = self.kuma.sample(alpha, beta).clamp(1e-6, 1.0 - 1e-6)
+        # Use deterministic gates when not training to make evaluation reproducible
+        if self.training and torch.is_grad_enabled():
+            g = self.kuma.sample(alpha, beta)
+        else:
+            g = alpha / (alpha + beta)
+        g = g.clamp(1e-6, 1.0 - 1e-6)
 
         # Anchor = pool all tokens
         h_anchor = self.pooler({"token_embeddings": embeddings,

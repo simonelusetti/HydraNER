@@ -3,7 +3,7 @@ defaults:
 
 selector_model:
   threshold: 0.5
-  sbert_name: "sentence-transformers/all-MiniLM-L6-v2"
+  encoder_name: "sentence-transformers/all-MiniLM-L6-v2"
   loss:
     l_comp: 0.1
     l_s: 0.01
@@ -15,10 +15,10 @@ selector_model:
     betas: [0.9, 0.999]
 
 expert_model:
-  sbert_name: "sentence-transformers/all-MiniLM-L6-v2"
+  encoder_name: "sentence-transformers/all-MiniLM-L6-v2"
   contrastive_tau: 0.07
   expert:
-    num_experts: 2
+    num_experts: 8
     routing: "softmax"
     routing_tau: 1.0
     normalize: True
@@ -53,13 +53,12 @@ expert_model:
     betas: [0.9, 0.999]
 
 train:
-  selector_threshold: 0.5
-  num_stages: 5
-  stage_epochs: [5, 5, 5, 5, 5]
+  eval_only: False
+  validate_epoch: True
+  stages_epochs: [10]
   loss_weights:
     selector: 1.0
     expert: 1.0
-  epochs: 10
   grad_clip: 1.0
 
 data:
@@ -86,18 +85,11 @@ data:
     batch_size: 32
     num_workers: 0
     subset: 1.0
-    shuffle: False
-
-eval:
-  eval_only: False
+    shuffle: False  
 
 runtime:
   num_threads: 8
-
-device: "cuda"
-
-logging:
-  metrics_only: False
+  device: "cuda"
 
 array: 0
 

@@ -599,7 +599,7 @@ def initialize_dataloaders(cfg, logger):
             batch_size=dev_cfg.batch_size,
             collate_fn=collate,
             num_workers=dev_cfg.num_workers,
-            pin_memory=(cfg.device == "cuda"),
+            pin_memory=(cfg.runtime.device == "cuda"),
             persistent_workers=(dev_cfg.num_workers > 0),
             shuffle=bool(dev_cfg.shuffle),
         )
@@ -609,7 +609,7 @@ def initialize_dataloaders(cfg, logger):
         batch_size=train_cfg.batch_size,
         collate_fn=collate,
         num_workers=train_cfg.num_workers,
-        pin_memory=(cfg.device == "cuda"),
+        pin_memory=(cfg.runtime.device == "cuda"),
         persistent_workers=(train_cfg.num_workers > 0),
         shuffle=train_cfg.shuffle,
     )
@@ -618,7 +618,7 @@ def initialize_dataloaders(cfg, logger):
         batch_size=eval_cfg.batch_size,
         collate_fn=collate,
         num_workers=eval_cfg.num_workers,
-        pin_memory=(cfg.device == "cuda"),
+        pin_memory=(cfg.runtime.device == "cuda"),
         persistent_workers=(eval_cfg.num_workers > 0),
         shuffle=eval_shuffle,
     )
