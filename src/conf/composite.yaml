@@ -18,7 +18,7 @@ expert_model:
   encoder_name: "sentence-transformers/all-MiniLM-L6-v2"
   contrastive_tau: 0.07
   expert:
-    num_experts: 8
+    num_experts: 4
     routing: "softmax"
     routing_tau: 1.0
     normalize: True
@@ -55,7 +55,9 @@ expert_model:
 train:
   eval_only: False
   validate_epoch: True
-  stages_epochs: [10]
+  stages_epochs: [5,5,5,5,5]
+  group_random_pct: 0.30  # fraction of leaves to include per random union (0.1 = 10% of leaves; >1 treated as percent)
+  group_random_trials: 10  # how many random unions to sample/report
   loss_weights:
     selector: 1.0
     expert: 1.0

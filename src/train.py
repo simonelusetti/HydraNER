@@ -1,4 +1,5 @@
 import os
+from math import ceil
 
 import torch
 from prettytable import PrettyTable
@@ -52,6 +53,11 @@ class BranchingCompositeTrainer:
         self.sel_optim_cfg = self.selector_cfg.optim
         self.exp_optim_cfg = self.expert_cfg.optim
         self.grad_clip = float(cfg.train.grad_clip)
+        pct = float(getattr(cfg.train, "group_random_pct", 0.0))
+        if pct > 1.0:
+            pct = pct / 100.0
+        self.group_random_pct = max(0.0, pct)
+        self.group_random_trials = int(getattr(cfg.train, "group_random_trials", 0))
 
         self.tree = BranchTree(
             self.selector_cfg,
@@ -63,7 +69,9 @@ class BranchingCompositeTrainer:
         )
         
     def metrics_table(self, metrics, sort_by="eval_f1", reverse=True):
-        metrics = sorted(metrics, key=lambda x: x[sort_by], reverse=reverse)
+        if not metrics:
+            return PrettyTable()
+        metrics = sorted(metrics, key=lambda x: x.get(sort_by, 0.0), reverse=reverse)
 
         table = PrettyTable()
         table.field_names = metrics[0].keys()
@@ -164,6 +172,36 @@ class BranchingCompositeTrainer:
                     branches_counts[name]["fp"] += fp
                     branches_counts[name]["fn"] += fn
         return branches_counts
+
+    def evaluate_union(self, loader, selected_names, desc="Branch Composite Union", disable_progress=False):
+        self.tree.set_mode(train=False)
+        total_tp, total_fp, total_fn = 0, 0, 0
+        disable_progress = disable_progress or self.disable_progress
+        with torch.no_grad():
+            iterator = tqdm(loader, desc=desc, disable=disable_progress)
+            for batch in iterator:
+                attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+                embeddings = batch["embeddings"].to(self.device, non_blocking=True)
+                ner_tags = batch["ner_tags"].to(self.device, non_blocking=True)
+                gold_mask = (ner_tags != -100) & (ner_tags > 0) & attention_mask.bool()
+
+                branches_pred = self.tree.forward_eval(
+                    embeddings,
+                    attention_mask,
+                )
+                union_pred = None
+                for (name, pred) in branches_pred:
+                    if name not in selected_names:
+                        continue
+                    mask = pred.to(torch.bool)
+                    union_pred = mask if union_pred is None else (union_pred | mask)
+                if union_pred is None:
+                    union_pred = torch.zeros_like(gold_mask, dtype=torch.bool)
+                tp, fp, fn = counts(union_pred, gold_mask)
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
+        return total_tp, total_fp, total_fn
        
     def evaluate(self):
         branches_eval_counts = self.evaluate_leaves(self.eval_dl, desc="Branch Composite Eval")
@@ -172,8 +210,8 @@ class BranchingCompositeTrainer:
             branches_dev_counts = self.evaluate_leaves(self.dev_dl, desc="Branch Composite Dev")
 
         branch_names = set(branches_eval_counts.keys()) | set(branches_dev_counts.keys())
-        
-        total_metrics = []
+
+        per_branch = []
         for name in branch_names:
             eval_counts = branches_eval_counts.get(name, {"tp": 0, "fp": 0, "fn": 0})
             dev_counts = branches_dev_counts.get(name, {"tp": 0, "fp": 0, "fn": 0})
@@ -192,7 +230,7 @@ class BranchingCompositeTrainer:
             else:
                 dev_f1 = dev_p = dev_r = None
 
-            total_metrics.append({
+            per_branch.append({
                 "name": name,
                 "eval_f1": eval_f1,
                 "eval_precision": eval_p,
@@ -201,6 +239,50 @@ class BranchingCompositeTrainer:
                 "dev_precision": dev_p,
                 "dev_recall": dev_r,
             })
+
+        total_metrics = []
+        if self.group_random_pct > 0.0 and per_branch and self.dev_dl is not None:
+            k = max(1, min(len(per_branch), ceil(self.group_random_pct * len(per_branch))))
+            # higher eval_f1 rank => higher weight (linear with reversed rank)
+            sorted_by_f1 = sorted(per_branch, key=lambda x: x.get("eval_f1", 0.0), reverse=True)
+            weights = [len(sorted_by_f1) - idx for idx, _ in enumerate(sorted_by_f1)]
+            weight_tensor = torch.tensor(weights, dtype=torch.float)
+            branch_order = [row["name"] for row in sorted_by_f1]
+
+            trials = max(1, self.group_random_trials)
+            for trial in tqdm(range(trials), disable=self.disable_progress, desc="Branch Composite Random Group Eval"):
+                # sample without replacement, weighted by rank
+                sampled_indices = torch.multinomial(weight_tensor, num_samples=k, replacement=False)
+                selected_names = [branch_order[idx] for idx in sampled_indices.tolist()]
+
+                tp_eval_union, fp_eval_union, fn_eval_union = self.evaluate_union(
+                    self.eval_dl, selected_names, desc=f"Branch Composite Union Eval rand trial {trial + 1}", disable_progress=True
+                )
+                tp_dev_union, fp_dev_union, fn_dev_union = self.evaluate_union(
+                    self.dev_dl, selected_names, desc=f"Branch Composite Union Dev rand trial {trial + 1}", disable_progress=True
+                )
+
+                eval_union_f1, eval_union_p, eval_union_r = metrics_from_counts(
+                    tp_eval_union,
+                    fp_eval_union,
+                    fn_eval_union,
+                ) if tp_eval_union is not None else (0.0, 0.0, 0.0)
+                dev_union_f1, dev_union_p, dev_union_r = metrics_from_counts(
+                    tp_dev_union,
+                    fp_dev_union,
+                    fn_dev_union,
+                ) if tp_dev_union is not None else (0.0, 0.0, 0.0)
+
+                pct_display = int(round(self.group_random_pct * 100))
+                total_metrics.append({
+                    "name": f"group_rand_{pct_display}pct_k{k}_trial{trial + 1}",
+                    "eval_f1": eval_union_f1,
+                    "eval_precision": eval_union_p,
+                    "eval_recall": eval_union_r,
+                    "dev_f1": dev_union_f1,
+                    "dev_precision": dev_union_p,
+                    "dev_recall": dev_union_r,
+                })
 
         return total_metrics
 
