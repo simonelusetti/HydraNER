@@ -1,5 +1,6 @@
 import os
 from math import ceil
+from math import ceil
 
 import torch
 from prettytable import PrettyTable
@@ -11,6 +12,11 @@ from .utils import load_sbert_pooler, get_logger, counts,\
     configure_runtime, metrics_from_counts, should_disable_tqdm
 from .tree import BranchTree
 from .data import initialize_dataloaders
+from . import diagnostics
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover - optional dependency
+    SummaryWriter = None
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -58,6 +64,22 @@ class BranchingCompositeTrainer:
             pct = pct / 100.0
         self.group_random_pct = max(0.0, pct)
         self.group_random_trials = int(getattr(cfg.train, "group_random_trials", 0))
+        self.group_union_enabled = bool(getattr(cfg.train, "group_union_enabled", True))
+
+        diag_cfg = getattr(cfg, "diagnostics", None)
+        self.diag_enabled = bool(getattr(diag_cfg, "enabled", False)) if diag_cfg is not None else False
+        self.diag_interval = int(getattr(diag_cfg, "interval_steps", 0)) if diag_cfg is not None else 0
+        self.diag_max_leaves = int(getattr(diag_cfg, "max_leaves", 1)) if diag_cfg is not None else 1
+        self.diag_skip_eval = bool(getattr(diag_cfg, "skip_eval", False)) if diag_cfg is not None else False
+        tb_dir = ""
+        if diag_cfg is not None:
+            tb_dir = getattr(diag_cfg, "tensorboard_dir", "") or ""
+        self.tb_writer = None
+        if self.diag_enabled and SummaryWriter is not None:
+            log_dir = tb_dir if tb_dir else os.path.join(os.getcwd(), "tb")
+            self.tb_writer = SummaryWriter(log_dir=log_dir)
+        self.diag_trackers = {}
+        self.global_step = 0
 
         self.tree = BranchTree(
             self.selector_cfg,
@@ -97,10 +119,16 @@ class BranchingCompositeTrainer:
                 avg_loss,
             )
             metrics = self.evaluate()
-            self.logger.info("Stage %d evaluation metrics:\n%s", stage + 1, self.metrics_table(metrics))
+            if metrics:
+                self.logger.info("Stage %d evaluation metrics:\n%s", stage + 1, self.metrics_table(metrics))
+            elif self.diag_enabled:
+                self.logger.info("Stage %d evaluation skipped (diagnostics enabled).")
             self._save_checkpoint()
             if stage < self.num_stages - 1:
                 self.tree.extend()
+        if self.tb_writer is not None:
+            self.tb_writer.flush()
+            self.tb_writer.close()
         
     def _train_stage(self, num_epochs, stage):
         total_loss = 0.0
@@ -123,9 +151,13 @@ class BranchingCompositeTrainer:
         self.tree.set_mode(train=True)
 
         for batch in tqdm(self.train_dl, f"Branch Composite Train {epoch + 1}", disable=self.disable_progress):
+            self.global_step += 1
+            want_diag = self.diag_enabled and self.diag_interval > 0 and (self.global_step % self.diag_interval == 0)
+
             leaves = self.tree.forward_train(
                 batch["embeddings"].to(self.device, non_blocking=True),
-                batch["attention_mask"].to(self.device, non_blocking=True)
+                batch["attention_mask"].to(self.device, non_blocking=True),
+                return_debug=want_diag,
             )
             for idx, leaf in enumerate(leaves):
                 node = leaf["node"]
@@ -144,7 +176,47 @@ class BranchingCompositeTrainer:
                 node.selector_optimizer.step()
                 node.expert_optimizer.step()
 
+            if want_diag:
+                self._run_diagnostics(batch, leaves)
+
         return total_loss / len(self.train_dl)
+
+    def _run_diagnostics(self, batch, leaves):
+        """Run diagnostics on a subset of leaves."""
+        attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+        for leaf in leaves[: self.diag_max_leaves]:
+            debug = leaf.get("debug")
+            if not debug:
+                continue
+            name = BranchTree.path_to_name(leaf["node"].path)
+            tracker = self.diag_trackers.get(name)
+            if tracker is None:
+                tracker = diagnostics.ExpertTracker()
+                self.diag_trackers[name] = tracker
+
+            pi = debug["pi"]
+            factors = debug["factors"]
+            anchor = debug["anchor"]
+            recon = debug["reconstruction"]
+            selected_mask = debug.get("selected_mask", attention_mask)
+
+            # use the first sample for expert/alignment metrics; routing keeps batch
+            sample_z = factors.mean(dim=0)
+            sample_h = recon[0]
+            sample_h_sbert = anchor[0]
+            report = diagnostics.debug_report(
+                pi=pi,
+                z=sample_z,
+                h=sample_h,
+                h_sbert=sample_h_sbert,
+                attention_mask=selected_mask,
+                tracker=tracker,
+                writer=self.tb_writer,
+                step=self.global_step,
+            )
+            if report.get("warnings"):
+                for w in report["warnings"]:
+                    self.logger.warning("[diag %s] %s", name, w)
     
     def evaluate_leaves(self, loader, desc="Branch Composite Eval"):
         self.tree.set_mode(train=False)
@@ -204,6 +276,9 @@ class BranchingCompositeTrainer:
         return total_tp, total_fp, total_fn
        
     def evaluate(self):
+        if self.diag_enabled and self.diag_skip_eval:
+            self.logger.info("Diagnostics enabled; skipping evaluation metrics.")
+            return []
         branches_eval_counts = self.evaluate_leaves(self.eval_dl, desc="Branch Composite Eval")
         branches_dev_counts = {}
         if self.dev_dl is not None:
@@ -241,7 +316,12 @@ class BranchingCompositeTrainer:
             })
 
         total_metrics = []
-        if self.group_random_pct > 0.0 and per_branch and self.dev_dl is not None:
+        if (
+            self.group_union_enabled
+            and self.group_random_pct > 0.0
+            and per_branch
+            and self.dev_dl is not None
+        ):
             k = max(1, min(len(per_branch), ceil(self.group_random_pct * len(per_branch))))
             # higher eval_f1 rank => higher weight (linear with reversed rank)
             sorted_by_f1 = sorted(per_branch, key=lambda x: x.get("eval_f1", 0.0), reverse=True)
@@ -283,6 +363,9 @@ class BranchingCompositeTrainer:
                     "dev_precision": dev_union_p,
                     "dev_recall": dev_union_r,
                 })
+
+        if not total_metrics:
+            total_metrics = per_branch
 
         return total_metrics
 

@@ -58,10 +58,18 @@ train:
   stages_epochs: [5,5,5,5,5]
   group_random_pct: 0.30  # fraction of leaves to include per random union (0.1 = 10% of leaves; >1 treated as percent)
   group_random_trials: 10  # how many random unions to sample/report
+  group_union_enabled: true  # if false, skip union-of-branches evaluation
   loss_weights:
     selector: 1.0
     expert: 1.0
   grad_clip: 1.0
+
+diagnostics:
+  enabled: false
+  interval_steps: 200   # run diagnostics every N steps
+  max_leaves: 2         # number of leaves to sample per diagnostic run
+  tensorboard_dir: ""   # if empty, uses Hydra run dir / 'tb'
+  skip_eval: false      # when true, diagnostics run and evaluation metrics are skipped
 
 data:
   rebuild_ds: False

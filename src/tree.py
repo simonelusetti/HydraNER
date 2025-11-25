@@ -183,7 +183,8 @@ class BranchNode:
     def _forward_train(
         self,
         embeddings,
-        attention_mask
+        attention_mask,
+        return_debug: bool = False,
     ):
         if attention_mask.sum() == 0:
             return [{
@@ -210,7 +211,8 @@ class BranchNode:
                 child_embeddings = selected_embeddings * child_bool.unsqueeze(-1).to(selected_embeddings.dtype)
                 child_stats = child._forward_train(
                     child_embeddings,
-                    child_mask
+                    child_mask,
+                    return_debug=return_debug,
                 )
                 children_stats = children_stats + child_stats
             return children_stats
@@ -227,10 +229,23 @@ class BranchNode:
             self.expert, selected_embeddings, selected_mask
         )
 
+        debug = None
+        if return_debug:
+            debug = {
+                "pi": expert_output["pi"].detach(),
+                "factors": expert_output["factors"].detach(),
+                "anchor": expert_output["anchor"].detach(),
+                "reconstruction": expert_output["reconstruction"].detach(),
+                "selection_mask": selection_mask.detach(),
+                "selected_mask": selected_mask.detach(),
+                "gates": selector_output["gates"].detach(),
+            }
+
         return [{
                 "node": self,
                 "selector_loss": selector_loss,
-                "expert_loss": expert_loss
+                "expert_loss": expert_loss,
+                "debug": debug,
             }]
         
     def _forward_eval(
@@ -407,11 +422,13 @@ class BranchTree:
     def forward_train(
         self,
         embeddings,
-        attention_mask
+        attention_mask,
+        return_debug: bool = False,
     ):
         return self.root._forward_train(
             embeddings,
-            attention_mask
+            attention_mask,
+            return_debug=return_debug,
         )
         
     def forward_eval(
