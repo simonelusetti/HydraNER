@@ -25,9 +25,11 @@ class ExpertModel(nn.Module):
         self.routing_tau = float(expert_cfg.routing_tau)
         self.normalize_factors = bool(expert_cfg.normalize)
         self.dropout = float(expert_cfg.dropout)
-        self.use_balance = expert_cfg.use_balance
-        self.use_diversity = expert_cfg.use_diversity
-        self.use_continuity = bool(expert_cfg.use_continuity)
+
+        loss_weights = cfg.loss_weights
+        self.use_balance = loss_weights.balance is not None and float(loss_weights.balance) != 0.0
+        self.use_diversity = loss_weights.diversity is not None and float(loss_weights.diversity) != 0.0
+        self.use_continuity = loss_weights.continuity is not None and float(loss_weights.continuity) != 0.0
 
         if pooler is not None and embedding_dim is not None:
             self.sbert = None
@@ -89,7 +91,8 @@ class ExpertModel(nn.Module):
             recon_modules.append(nn.Sequential(*layers))
         self.reconstruction_heads = nn.ModuleList(recon_modules)
 
-        self.use_token_decoder = bool(expert_cfg.use_token_decoder)
+        token_weight = cfg.loss_weights.token
+        self.use_token_decoder = token_weight is not None and float(token_weight) != 0.0
         if self.use_token_decoder:
             decoder_hidden = int(expert_cfg.decoder_hidden)
             decoder_layers = []

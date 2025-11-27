@@ -34,18 +34,15 @@ class BranchNode:
         self.path = path
         self.selector_cfg = selector_cfg
         self.expert_cfg = expert_cfg
+        self.prototype_cfg = expert_cfg.prototype
         self.children: list["BranchNode"] = []
         weights_cfg = expert_cfg.loss_weights
-        self.expert_weights = {
-            "sent": float(weights_cfg.sent),
-            "token": float(weights_cfg.token),
-            "entropy": float(weights_cfg.entropy),
-            "overlap": float(weights_cfg.overlap),
-            "diversity": float(weights_cfg.diversity),
-            "balance": float(weights_cfg.balance),
-        }
-        if getattr(expert_cfg.expert, "use_continuity", False):
-            self.expert_weights["continuity"] = float(getattr(weights_cfg, "continuity", 0.0))
+        self.expert_weights = {}
+        for key in ["sent", "token", "entropy", "overlap", "diversity", "balance", "continuity"]:
+            value = getattr(weights_cfg, key)
+            if value is None:
+                continue
+            self.expert_weights[key] = float(value)
         self.contrastive_tau = float(expert_cfg.contrastive_tau)
 
         self.selector = RationaleSelectorModel(
@@ -60,6 +57,16 @@ class BranchNode:
             embedding_dim=expert_hidden_dim,
         ).to(device)
 
+        self.prototype = None
+        proto_cons = self.prototype_cfg.lambda_cons
+        proto_sep = self.prototype_cfg.lambda_sep
+        if self.prototype_cfg is not None and (
+            (proto_cons is not None and proto_cons != 0.0)
+            or (proto_sep is not None and proto_sep != 0.0)
+        ):
+            factor_dim = int(self.expert_cfg.expert.factor_dim)
+            self.prototype = torch.zeros(self.expert_cfg.expert.num_experts, factor_dim, device=device)
+
     def no_grad(self):
         for param in self.selector.parameters():
             param.requires_grad_(False)
@@ -71,52 +78,41 @@ class BranchNode:
 
     def _selector_forward(self, selector, embeddings, mask):
         outputs = selector(embeddings, mask)
+        cfg_loss = self.selector_cfg.loss
 
         h_anchor = outputs["h_anchor"]
         h_rat = outputs["h_rat"]
         h_comp = outputs["h_comp"]
         gates = outputs["gates"]
 
-        rat_loss = nt_xent(h_rat, h_anchor, temperature=self.selector_cfg.loss.tau)
-        comp_loss = complement_loss(
-            h_comp,
-            h_anchor,
-            temperature=float(self.selector_cfg.loss.tau),
-        )
+        rat_loss = nt_xent(h_rat, h_anchor, temperature=cfg_loss.tau)
+        comp_loss = complement_loss(h_comp, h_anchor, temperature=float(cfg_loss.tau))
         sparsity = rat_sparsity_loss(gates, mask)
         tv = total_variation_1d(gates, mask)
 
         loss = rat_loss
-        loss = loss + float(self.selector_cfg.loss.l_comp) * comp_loss
-        loss = loss + float(self.selector_cfg.loss.l_s) * sparsity
-        loss = loss + float(self.selector_cfg.loss.l_tv) * tv
+        loss = loss + float(cfg_loss.l_comp) * comp_loss
+        loss = loss + float(cfg_loss.l_s) * sparsity
+        loss = loss + float(cfg_loss.l_tv) * tv
 
-        losses = {
+        outputs["losses"] = {
             "rat": float(rat_loss.detach()),
             "comp": float(comp_loss.detach()),
             "sparsity": float(sparsity.detach()),
             "tv": float(tv.detach()),
             "total": float(loss.detach()),
         }
-
-        return loss, losses, outputs
+        return loss, outputs["losses"], outputs
 
     def _expert_forward(self, expert, embeddings, mask):
         outputs = expert(embeddings, mask)
         routing_weights = outputs["pi"]
-        anchor = outputs["anchor"]
-        reconstruction = outputs["reconstruction"]
+        anchor = F.normalize(outputs["anchor"], dim=-1)
+        reconstruction = F.normalize(outputs["reconstruction"], dim=-1)
 
-        anchor = F.normalize(anchor, dim=-1)
-        reconstruction = F.normalize(reconstruction, dim=-1)
+        sent_loss = nt_xent(anchor, reconstruction, temperature=self.contrastive_tau)
 
-        logits = anchor @ reconstruction.t() / max(self.contrastive_tau, 1e-6)
-        targets = torch.arange(logits.size(0), device=logits.device)
-        loss_ab = F.cross_entropy(logits, targets)
-        loss_ba = F.cross_entropy(logits.t(), targets)
-        sent_loss = 0.5 * (loss_ab + loss_ba)
-
-        token_reconstruction = outputs.get("token_reconstruction")
+        token_reconstruction = outputs["token_reconstruction"] if "token_reconstruction" in outputs else None
         if token_reconstruction is not None:
             mask_float_tok = mask.unsqueeze(-1).to(dtype=token_reconstruction.dtype)
             diff = token_reconstruction - embeddings
@@ -126,31 +122,22 @@ class BranchNode:
 
         mask_float = mask.to(dtype=routing_weights.dtype)
 
-        entropy = -(routing_weights.clamp_min(expert.small_value).log() * routing_weights)
-        entropy = (entropy.sum(dim=-1) * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
-        entropy_loss = entropy.mean()
+        loss_components = {"sent": sent_loss, "token": token_loss}
 
-        pi_sq = (routing_weights ** 2).sum(dim=-1)
-        overlap = 0.5 * (1.0 - pi_sq)
-        overlap = (overlap * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
-        overlap_loss = overlap.mean()
+        if "overlap" in self.expert_weights:
+            pi_sq = (routing_weights ** 2).sum(dim=-1)
+            overlap = 1.0 - pi_sq
+            overlap = (overlap * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
+            loss_components["overlap"] = overlap.mean()
 
-        if expert.use_balance:
+        if "balance" in self.expert_weights and expert.use_balance:
             expert_mass = routing_weights.sum(dim=1)
             total_tokens = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
             balanced_mass = expert_mass / total_tokens
             target = routing_weights.new_full((1, expert.num_experts), 1.0 / expert.num_experts)
-            balance_loss = ((balanced_mass.mean(dim=0, keepdim=True) - target) ** 2).sum()
-        else:
-            balance_loss = routing_weights.new_zeros(())
+            loss_components["balance"] = ((balanced_mass.mean(dim=0, keepdim=True) - target) ** 2).sum()
 
-        if expert.use_diversity:
-            diversity_loss = expert._compute_diversity_penalty(outputs["factors"])
-        else:
-            diversity_loss = routing_weights.new_zeros(())
-
-        continuity_loss = None
-        if expert.use_continuity:
+        if "continuity" in self.expert_weights and expert.use_continuity:
             if routing_weights.size(1) > 1:
                 pair_mask = mask_float[:, 1:] * mask_float[:, :-1]
                 diff = routing_weights[:, 1:, :] - routing_weights[:, :-1, :]
@@ -160,24 +147,55 @@ class BranchNode:
                 continuity_loss = numerator / denominator
             else:
                 continuity_loss = routing_weights.new_zeros(routing_weights.size(0))
-
-        loss_components = {
-            "sent": sent_loss,
-            "token": token_loss,
-            "entropy": entropy_loss,
-            "overlap": overlap_loss,
-            "diversity": diversity_loss,
-            "balance": balance_loss,
-        }
-
-        if "continuity" in self.expert_weights:
-            if continuity_loss is None:
-                raise KeyError("Continuity weight configured but model continuity output missing.")
             loss_components["continuity"] = continuity_loss.mean()
 
-        loss = sum(self.expert_weights[key] * loss_components[key] for key in loss_components)
+        loss = 0.0
+        for key, weight in self.expert_weights.items():
+            if key not in loss_components:
+                continue
+            loss = loss + weight * loss_components[key]
+
         losses = {key: float(value.detach()) for key, value in loss_components.items()}
+
+        # Prototype consistency / separation (optional)
+        if self.prototype is not None:
+            eps = float(self.prototype_cfg.eps)
+            decay = float(self.prototype_cfg.ema_decay)
+            lambda_cons = float(self.prototype_cfg.lambda_cons) if self.prototype_cfg.lambda_cons is not None else 0.0
+            lambda_sep = float(self.prototype_cfg.lambda_sep) if self.prototype_cfg.lambda_sep is not None else 0.0
+            margin = float(self.prototype_cfg.margin)
+
+            mask_float = mask.to(routing_weights.dtype)
+            token_counts = mask_float.sum(dim=1, keepdim=True).clamp_min(eps)
+            usage = (routing_weights * mask_float.unsqueeze(-1)).sum(dim=1) / token_counts
+
+            proto = self.prototype.detach()
+            diff = outputs["factors"] - proto.unsqueeze(0)
+            cons_per = (usage * diff.pow(2).sum(dim=-1)).sum(dim=1)
+            cons_loss = cons_per.mean()
+
+            if lambda_cons > 0.0:
+                loss = loss + lambda_cons * cons_loss
+                losses["proto_cons"] = float(cons_loss.detach())
+
+            # EMA update (no grad)
+            with torch.no_grad():
+                num = (usage.unsqueeze(-1) * outputs["factors"]).sum(dim=0)
+                denom = usage.sum(dim=0).unsqueeze(-1).clamp_min(eps)
+                update = num / denom
+                self.prototype.mul_(decay).add_(update * (1.0 - decay))
+
+            if lambda_sep > 0.0:
+                proto_norm = proto / (proto.norm(dim=-1, keepdim=True).clamp_min(eps))
+                cos = proto_norm @ proto_norm.t()
+                off_diag = cos - torch.eye(cos.size(0), device=cos.device)
+                sep = torch.clamp(off_diag - (1.0 - margin), min=0.0)
+                sep_loss = sep.sum() / max(1, cos.numel() - cos.size(0))
+                loss = loss + lambda_sep * sep_loss
+                losses["proto_sep"] = float(sep_loss.detach())
+
         losses["total"] = float(loss.detach())
+        outputs["losses"] = losses
         return loss, losses, outputs
 
     def _forward_train(
@@ -217,7 +235,7 @@ class BranchNode:
                 children_stats = children_stats + child_stats
             return children_stats
        
-        selector_loss, _, selector_output = self._selector_forward(
+        selector_loss, selector_losses, selector_output = self._selector_forward(
             self.selector, embeddings, attention_mask
         )
         
@@ -225,7 +243,7 @@ class BranchNode:
         selected_embeddings = embeddings * selection_mask.unsqueeze(-1)
         selected_mask = (attention_mask * selection_mask.long()).clamp(max=1)
 
-        expert_loss, _, expert_output = self._expert_forward(
+        expert_loss, expert_losses, expert_output = self._expert_forward(
             self.expert, selected_embeddings, selected_mask
         )
 
@@ -244,7 +262,9 @@ class BranchNode:
         return [{
                 "node": self,
                 "selector_loss": selector_loss,
+                "selector_losses": selector_losses,
                 "expert_loss": expert_loss,
+                "expert_losses": expert_losses,
                 "debug": debug,
             }]
         
@@ -402,7 +422,7 @@ class BranchTree:
 
     def _initialize_leaf_optimizers(self, leaves):
         for leaf in leaves:
-            if getattr(leaf, "selector_optimizer", None) is not None:
+            if hasattr(leaf, "selector_optimizer") and leaf.selector_optimizer is not None:
                 continue
             selector_params = list(leaf.selector.parameters())
             expert_params = list(leaf.expert.parameters())
@@ -448,13 +468,13 @@ class BranchTree:
             
     @staticmethod
     def sorted_leaves(metrics_dict: dict[str, dict[str, float]]):
-        return sorted(metrics_dict.items(), key=lambda item: item[1].get("f1", 0.0), reverse=True)
+        return sorted(metrics_dict.items(), key=lambda item: item[1]["f1"], reverse=True)
 
     @staticmethod
     def best_leaf(metrics_dict: dict[str, dict[str, float]]):
         if not metrics_dict:
             return None
-        return max(metrics_dict.items(), key=lambda item: item[1].get("f1", 0.0))
+        return max(metrics_dict.items(), key=lambda item: item[1]["f1"])
 
     @staticmethod
     def path_to_name(path: tuple[int, ...]) -> str:

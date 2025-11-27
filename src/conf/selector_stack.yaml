@@ -30,21 +30,14 @@ expert_model:
     shared_transform: True
     transform_dropout: 0.0
     reconstruction_hidden: 0
-    use_token_decoder: False
     decoder_hidden: 384
-    use_balance: True
-    use_diversity: True
-    use_continuity: True
-    use_attention: False
-    attention_heads: 4
-    attention_dropout: 0.0
   loss_weights:
     sent: 1.0
     token: 1.0
-    entropy: 0.01
+    entropy: null
     overlap: 0.01
     continuity: 0.01
-    diversity: 0.01
+    diversity: null
     balance: 0.01
     attention: 0.0
   optim:

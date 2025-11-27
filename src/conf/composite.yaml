@@ -30,31 +30,30 @@ expert_model:
     shared_transform: True
     transform_dropout: 0.0
     reconstruction_hidden: 0
-    use_token_decoder: False
     decoder_hidden: 384
-    use_balance: True
-    use_diversity: True
-    use_continuity: True
-    use_attention: False
-    attention_heads: 4
-    attention_dropout: 0.0
   loss_weights:
     sent: 1.0
-    token: 1.0
-    entropy: 0.01
-    overlap: 0.01
-    continuity: 0.01
-    diversity: 0.01
-    balance: 0.01
-    attention: 0.0
+    token: 1.0        # set to null to disable token decoder + loss
+    entropy: null     # removed entropy regularizer
+    overlap: 1.0     # set to null to disable
+    continuity: 1.0  # set to null to disable
+    diversity: null   # removed diversity regularizer
+    balance: 1.0   # set to null to disable
+    attention: 1.0    # set to null to disable
   optim:
     lr: 5e-5
     weight_decay: 1e-2
     betas: [0.9, 0.999]
+  prototype:
+    lambda_cons: 1.0    # set to a float to enable consistency loss; null disables
+    lambda_sep: 1.0     # set to a float to enable separation loss; null disables
+    ema_decay: 0.5       # EMA decay for prototype updates
+    margin: 0.3          # separation margin on cosine sims
+    eps: 1e-6
 
 train:
   eval_only: False
-  validate_epoch: True
+  validate_epoch: False
   stages_epochs: [5,5,5,5,5]
   group_random_pct: 0.30  # fraction of leaves to include per random union (0.1 = 10% of leaves; >1 treated as percent)
   group_random_trials: 10  # how many random unions to sample/report
@@ -65,8 +64,7 @@ train:
   grad_clip: 1.0
 
 diagnostics:
-  enabled: false
-  interval_steps: 200   # run diagnostics every N steps
+  interval_steps: null  # set to an integer to enable diagnostics; null disables
   max_leaves: 2         # number of leaves to sample per diagnostic run
   tensorboard_dir: ""   # if empty, uses Hydra run dir / 'tb'
   skip_eval: false      # when true, diagnostics run and evaluation metrics are skipped
