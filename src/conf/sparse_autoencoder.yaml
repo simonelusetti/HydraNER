@@ -1,0 +1,76 @@
+defaults:
+  - _self_
+
+sae:
+  expansion: 10.0          # d_hidden = expansion * d_model
+  alpha: 8.6e-4           # sparsity weight on codes
+  lr: 1e-3
+  weight_decay: 0.0
+  grad_clip: 1.0
+  max_tokens_per_batch: null  # downsample tokens per step for memory; set null to disable
+
+train:
+  eval_only: False
+  epochs: 30
+  validate_epoch: True
+  log_interval: 50
+  checkpoint: "sparse_autoencoder.pth"
+
+entity_eval:
+  threshold: 0.3           # activation threshold for entity prediction on the chosen dimension
+  run_after_epoch: True
+
+data:
+  rebuild_ds: False
+  train:
+    dataset: "wikiann"
+    config: "en"
+    batch_size: 16
+    num_workers: 0
+    subset: 1.0
+    shuffle: True
+  eval:
+    dataset: "wikiann"
+    config: "en"
+    split: "validation"
+    batch_size: 16
+    num_workers: 0
+    subset: 1.0
+    shuffle: False
+  dev:
+    dataset: "wikiann"
+    config: "en"
+    split: "test"
+    batch_size: 16
+    num_workers: 0
+    subset: 1.0
+    shuffle: False
+
+runtime:
+  num_threads: 8
+  device: "cuda"
+
+array: 0
+
+dora:
+  exclude: ["eval.*", "data.rebuild_ds", "logging.*"]
+
+slurm:
+  partition: "boost_usr_prod"
+  gpus: 1
+  mem_per_gpu: 32
+  time: 120
+  cpus_per_gpu: 8
+  setup:
+    - "module load python/3.11.7"
+    - "source /leonardo/home/userexternal/slusetti/MoE/.venv/bin/activate"
+    - "export SLURM_CPU_BIND=none"
+    - "export HF_HOME=/leonardo_work/IscrC_LUSE/slusetti/hf-cache"
+    - "export HF_DATASETS_CACHE=$HF_HOME/datasets"
+    - "export TRANSFORMERS_CACHE=$HF_HOME/transformers"
+    - "export HF_MODULES_CACHE=$HF_HOME/modules"
+    - "export HF_HUB_CACHE=$HF_HOME/hub"
+    - "export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub"
+    - "export HF_HUB_OFFLINE=1"
+    - "export TRANSFORMERS_OFFLINE=1"
+    - "export HF_DATASETS_OFFLINE=1"
