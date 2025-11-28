@@ -1,7 +1,6 @@
 import os
 from collections import defaultdict
 from math import ceil
-from math import ceil
 
 import torch
 from prettytable import PrettyTable
@@ -61,11 +60,7 @@ class BranchingCompositeTrainer:
         self.sel_optim_cfg = self.selector_cfg.optim
         self.exp_optim_cfg = self.expert_cfg.optim
         self.grad_clip = float(cfg.train.grad_clip)
-        pct = float(cfg.train.group_random_pct)
-        if pct > 1.0:
-            pct = pct / 100.0
-        self.group_random_pct = max(0.0, pct)
-        self.group_random_trials = int(cfg.train.group_random_trials)
+        self.group_min_recall = max(0.0, float(cfg.train.group_min_recall))
         self.group_union_enabled = bool(cfg.train.group_union_enabled)
 
         diag_cfg = cfg.diagnostics
@@ -143,9 +138,9 @@ class BranchingCompositeTrainer:
         return total_loss / num_epochs
 
     def _single_epoch(self, epoch):
-        total_loss = 0.0
+        loss_count = 0
         loss_sums = defaultdict(float)
-        loss_counts = defaultdict(int)
+        
         self.tree.set_mode(train=True)
 
         for batch in tqdm(self.train_dl, f"Branch Composite Train {epoch + 1}", disable=self.disable_progress):
@@ -160,22 +155,15 @@ class BranchingCompositeTrainer:
             for idx, leaf in enumerate(leaves):
                 node = leaf["node"]
                 loss = self.selector_weight * leaf["selector_loss"] + self.expert_weight * leaf["expert_loss"]
-                total_loss += loss.item()
+                loss_count += 1
                 loss_sums["total"] += loss.item()
-                loss_counts["total"] += 1
-                loss_sums["selector_loss"] += float(leaf["selector_loss"].detach())
-                loss_counts["selector_loss"] += 1
-                loss_sums["expert_loss"] += float(leaf["expert_loss"].detach())
-                loss_counts["expert_loss"] += 1
 
                 sel_comp = leaf["selector_losses"]
                 for key, val in sel_comp.items():
                     loss_sums[f"selector/{key}"] += float(val)
-                    loss_counts[f"selector/{key}"] += 1
                 exp_comp = leaf["expert_losses"]
                 for key, val in exp_comp.items():
                     loss_sums[f"expert/{key}"] += float(val)
-                    loss_counts[f"expert/{key}"] += 1
 
                 node.selector_optimizer.zero_grad(set_to_none=True)
                 node.expert_optimizer.zero_grad(set_to_none=True)
@@ -192,15 +180,14 @@ class BranchingCompositeTrainer:
             if want_diag:
                 self._run_diagnostics(batch, leaves)
 
-        if loss_counts:
-            avg_parts = {k: loss_sums[k] / max(1, loss_counts[k]) for k in loss_sums}
-            table = PrettyTable()
-            table.field_names = ["loss", "avg"]
-            for key in sorted(avg_parts.keys()):
-                table.add_row([key, f"{avg_parts[key]:.6f}"])
-            self.logger.info("Epoch %d loss breakdown:\n%s", epoch + 1, table)
+        avgerages = {k: v / loss_count for k, v in loss_sums.items()}
+        table = PrettyTable()
+        table.field_names = ["loss component", "avg"]
+        for key, avg in sorted(avgerages.items()):
+            table.add_row([key, f"{avg:.6f}"])
+        self.logger.info("Epoch %d loss breakdown:\n%s", epoch + 1, table)
 
-        return total_loss / len(self.train_dl)
+        return avgerages["total"]
 
     def _run_diagnostics(self, batch, leaves):
         """Run diagnostics on a subset of leaves."""
@@ -340,51 +327,46 @@ class BranchingCompositeTrainer:
         total_metrics = []
         if (
             self.group_union_enabled
-            and self.group_random_pct > 0.0
+            and self.group_min_recall > 0.0
             and per_branch
             and self.dev_dl is not None
         ):
-            k = max(1, min(len(per_branch), ceil(self.group_random_pct * len(per_branch))))
-            # higher eval_f1 rank => higher weight (linear with reversed rank)
-            sorted_by_f1 = sorted(per_branch, key=lambda x: x["eval_f1"], reverse=True)
-            weights = [len(sorted_by_f1) - idx for idx, _ in enumerate(sorted_by_f1)]
-            weight_tensor = torch.tensor(weights, dtype=torch.float)
-            branch_order = [row["name"] for row in sorted_by_f1]
+            sorted_by_prec = sorted(per_branch, key=lambda x: x["eval_recall"], reverse=True)
+            cumulative = 0.0
+            selected_names = []
+            for row in sorted_by_prec:
+                selected_names.append(row["name"])
+                cumulative += row["eval_recall"]
+                if cumulative >= self.group_min_recall:
+                    break
 
-            trials = max(1, self.group_random_trials)
-            for trial in tqdm(range(trials), disable=self.disable_progress, desc="Branch Composite Random Group Eval"):
-                # sample without replacement, weighted by rank
-                sampled_indices = torch.multinomial(weight_tensor, num_samples=k, replacement=False)
-                selected_names = [branch_order[idx] for idx in sampled_indices.tolist()]
+            tp_eval_union, fp_eval_union, fn_eval_union = self.evaluate_union(
+                self.eval_dl, selected_names, desc="Branch Composite Union Eval", disable_progress=True
+            )
+            tp_dev_union, fp_dev_union, fn_dev_union = self.evaluate_union(
+                self.dev_dl, selected_names, desc="Branch Composite Union Dev", disable_progress=True
+            )
 
-                tp_eval_union, fp_eval_union, fn_eval_union = self.evaluate_union(
-                    self.eval_dl, selected_names, desc=f"Branch Composite Union Eval rand trial {trial + 1}", disable_progress=True
-                )
-                tp_dev_union, fp_dev_union, fn_dev_union = self.evaluate_union(
-                    self.dev_dl, selected_names, desc=f"Branch Composite Union Dev rand trial {trial + 1}", disable_progress=True
-                )
+            eval_union_f1, eval_union_p, eval_union_r = metrics_from_counts(
+                tp_eval_union,
+                fp_eval_union,
+                fn_eval_union,
+            ) if tp_eval_union is not None else (0.0, 0.0, 0.0)
+            dev_union_f1, dev_union_p, dev_union_r = metrics_from_counts(
+                tp_dev_union,
+                fp_dev_union,
+                fn_dev_union,
+            ) if tp_dev_union is not None else (0.0, 0.0, 0.0)
 
-                eval_union_f1, eval_union_p, eval_union_r = metrics_from_counts(
-                    tp_eval_union,
-                    fp_eval_union,
-                    fn_eval_union,
-                ) if tp_eval_union is not None else (0.0, 0.0, 0.0)
-                dev_union_f1, dev_union_p, dev_union_r = metrics_from_counts(
-                    tp_dev_union,
-                    fp_dev_union,
-                    fn_dev_union,
-                ) if tp_dev_union is not None else (0.0, 0.0, 0.0)
-
-                pct_display = int(round(self.group_random_pct * 100))
-                total_metrics.append({
-                    "name": f"group_rand_{pct_display}pct_k{k}_trial{trial + 1}",
-                    "eval_f1": eval_union_f1,
-                    "eval_precision": eval_union_p,
-                    "eval_recall": eval_union_r,
-                    "dev_f1": dev_union_f1,
-                    "dev_precision": dev_union_p,
-                    "dev_recall": dev_union_r,
-                })
+            total_metrics.append({
+                "name": f"group_rec_target_{self.group_min_recall:.2f}_k{len(selected_names)}",
+                "eval_f1": eval_union_f1,
+                "eval_precision": eval_union_p,
+                "eval_recall": eval_union_r,
+                "dev_f1": dev_union_f1,
+                "dev_precision": dev_union_p,
+                "dev_recall": dev_union_r,
+            })
 
         if not total_metrics:
             total_metrics = per_branch

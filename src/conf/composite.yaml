@@ -34,19 +34,17 @@ expert_model:
   loss_weights:
     sent: 1.0
     token: 1.0        # set to null to disable token decoder + loss
-    entropy: null     # removed entropy regularizer
     overlap: 1.0     # set to null to disable
     continuity: 1.0  # set to null to disable
-    diversity: null   # removed diversity regularizer
     balance: 1.0   # set to null to disable
     attention: 1.0    # set to null to disable
+    prototype: 1.0    # set to null to disable
   optim:
     lr: 5e-5
     weight_decay: 1e-2
     betas: [0.9, 0.999]
   prototype:
-    lambda_cons: 1.0    # set to a float to enable consistency loss; null disables
-    lambda_sep: 1.0     # set to a float to enable separation loss; null disables
+    separation: 1.0     # set to a float to enable separation loss; null disables
     ema_decay: 0.5       # EMA decay for prototype updates
     margin: 0.3          # separation margin on cosine sims
     eps: 1e-6
@@ -55,9 +53,8 @@ train:
   eval_only: False
   validate_epoch: False
   stages_epochs: [5,5,5,5,5]
-  group_random_pct: 0.30  # fraction of leaves to include per random union (0.1 = 10% of leaves; >1 treated as percent)
-  group_random_trials: 10  # how many random unions to sample/report
   group_union_enabled: true  # if false, skip union-of-branches evaluation
+  group_min_recall: 0.8   # target cumulative recall for union selection; <=0 disables
   loss_weights:
     selector: 1.0
     expert: 1.0

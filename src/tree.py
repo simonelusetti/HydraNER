@@ -38,7 +38,7 @@ class BranchNode:
         self.children: list["BranchNode"] = []
         weights_cfg = expert_cfg.loss_weights
         self.expert_weights = {}
-        for key in ["sent", "token", "entropy", "overlap", "diversity", "balance", "continuity"]:
+        for key in ["sent", "token", "overlap", "balance", "continuity", "prototype"]:
             value = getattr(weights_cfg, key)
             if value is None:
                 continue
@@ -58,12 +58,8 @@ class BranchNode:
         ).to(device)
 
         self.prototype = None
-        proto_cons = self.prototype_cfg.lambda_cons
-        proto_sep = self.prototype_cfg.lambda_sep
-        if self.prototype_cfg is not None and (
-            (proto_cons is not None and proto_cons != 0.0)
-            or (proto_sep is not None and proto_sep != 0.0)
-        ):
+        self.prototype_separation_weight = self.prototype_cfg.separation
+        if self.prototype_cfg is not None:
             factor_dim = int(self.expert_cfg.expert.factor_dim)
             self.prototype = torch.zeros(self.expert_cfg.expert.num_experts, factor_dim, device=device)
 
@@ -95,14 +91,14 @@ class BranchNode:
         loss = loss + float(cfg_loss.l_s) * sparsity
         loss = loss + float(cfg_loss.l_tv) * tv
 
-        outputs["losses"] = {
+        losses = {
             "rat": float(rat_loss.detach()),
             "comp": float(comp_loss.detach()),
             "sparsity": float(sparsity.detach()),
             "tv": float(tv.detach()),
             "total": float(loss.detach()),
         }
-        return loss, outputs["losses"], outputs
+        return loss, losses, outputs
 
     def _expert_forward(self, expert, embeddings, mask):
         outputs = expert(embeddings, mask)
@@ -113,13 +109,12 @@ class BranchNode:
         sent_loss = nt_xent(anchor, reconstruction, temperature=self.contrastive_tau)
 
         token_reconstruction = outputs["token_reconstruction"] if "token_reconstruction" in outputs else None
+        token_loss = embeddings.new_tensor(0.0)
         if token_reconstruction is not None:
             mask_float_tok = mask.unsqueeze(-1).to(dtype=token_reconstruction.dtype)
             diff = token_reconstruction - embeddings
             token_loss = (diff.pow(2) * mask_float_tok).sum() / mask_float_tok.sum().clamp_min(1.0)
-        else:
-            token_loss = embeddings.new_tensor(0.0)
-
+            
         mask_float = mask.to(dtype=routing_weights.dtype)
 
         loss_components = {"sent": sent_loss, "token": token_loss}
@@ -148,21 +143,11 @@ class BranchNode:
             else:
                 continuity_loss = routing_weights.new_zeros(routing_weights.size(0))
             loss_components["continuity"] = continuity_loss.mean()
-
+            
         loss = 0.0
-        for key, weight in self.expert_weights.items():
-            if key not in loss_components:
-                continue
-            loss = loss + weight * loss_components[key]
-
-        losses = {key: float(value.detach()) for key, value in loss_components.items()}
-
-        # Prototype consistency / separation (optional)
         if self.prototype is not None:
             eps = float(self.prototype_cfg.eps)
             decay = float(self.prototype_cfg.ema_decay)
-            lambda_cons = float(self.prototype_cfg.lambda_cons) if self.prototype_cfg.lambda_cons is not None else 0.0
-            lambda_sep = float(self.prototype_cfg.lambda_sep) if self.prototype_cfg.lambda_sep is not None else 0.0
             margin = float(self.prototype_cfg.margin)
 
             mask_float = mask.to(routing_weights.dtype)
@@ -174,29 +159,32 @@ class BranchNode:
             cons_per = (usage * diff.pow(2).sum(dim=-1)).sum(dim=1)
             cons_loss = cons_per.mean()
 
-            if lambda_cons > 0.0:
-                loss = loss + lambda_cons * cons_loss
-                losses["proto_cons"] = float(cons_loss.detach())
+            loss_components["proto_cons"] = cons_loss
 
-            # EMA update (no grad)
             with torch.no_grad():
                 num = (usage.unsqueeze(-1) * outputs["factors"]).sum(dim=0)
                 denom = usage.sum(dim=0).unsqueeze(-1).clamp_min(eps)
                 update = num / denom
                 self.prototype.mul_(decay).add_(update * (1.0 - decay))
+            
+            proto_norm = proto / (proto.norm(dim=-1, keepdim=True).clamp_min(eps))
+            cos = proto_norm @ proto_norm.t()
+            off_diag = cos - torch.eye(cos.size(0), device=cos.device)
+            sep = torch.clamp(off_diag - (1.0 - margin), min=0.0)
+            loss_components["proto_sep"] = sep.sum() / max(1, cos.numel() - cos.size(0))
 
-            if lambda_sep > 0.0:
-                proto_norm = proto / (proto.norm(dim=-1, keepdim=True).clamp_min(eps))
-                cos = proto_norm @ proto_norm.t()
-                off_diag = cos - torch.eye(cos.size(0), device=cos.device)
-                sep = torch.clamp(off_diag - (1.0 - margin), min=0.0)
-                sep_loss = sep.sum() / max(1, cos.numel() - cos.size(0))
-                loss = loss + lambda_sep * sep_loss
-                losses["proto_sep"] = float(sep_loss.detach())
+        for key, weight in self.expert_weights.items():
+            if key not in loss_components:
+                continue
+            loss = loss + weight * loss_components[key]
+            
+        if self.prototype_separation_weight is not None: # separation isn't in weights
+            loss = loss + self.prototype_separation_weight * loss_components["proto_sep"]
 
-        losses["total"] = float(loss.detach())
-        outputs["losses"] = losses
-        return loss, losses, outputs
+        loss_components["total"] = loss
+        for k in loss_components:
+            loss_components[k] = float(loss_components[k].detach())
+        return loss, loss_components, outputs
 
     def _forward_train(
         self,

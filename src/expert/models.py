@@ -28,7 +28,6 @@ class ExpertModel(nn.Module):
 
         loss_weights = cfg.loss_weights
         self.use_balance = loss_weights.balance is not None and float(loss_weights.balance) != 0.0
-        self.use_diversity = loss_weights.diversity is not None and float(loss_weights.diversity) != 0.0
         self.use_continuity = loss_weights.continuity is not None and float(loss_weights.continuity) != 0.0
 
         if pooler is not None and embedding_dim is not None:
@@ -92,7 +91,8 @@ class ExpertModel(nn.Module):
         self.reconstruction_heads = nn.ModuleList(recon_modules)
 
         token_weight = cfg.loss_weights.token
-        self.use_token_decoder = token_weight is not None and float(token_weight) != 0.0
+        self.use_token_decoder = token_weight is not None
+        self.token_decoder = None
         if self.use_token_decoder:
             decoder_hidden = int(expert_cfg.decoder_hidden)
             decoder_layers = []
@@ -104,9 +104,7 @@ class ExpertModel(nn.Module):
                     decoder_layers.append(nn.Dropout(transform_dropout))
                 decoder_in = decoder_hidden
             decoder_layers.append(nn.Linear(decoder_in, enc_hidden))
-            self.token_decoder = nn.Sequential(*decoder_layers)
-        else:
-            self.token_decoder = None
+            self.token_decoder = nn.Sequential(*decoder_layers)            
 
         self.small_value = 1e-6
 
@@ -149,16 +147,6 @@ class ExpertModel(nn.Module):
         for idx, module in enumerate(self.expert_transforms):
             outputs.append(module(factors[:, idx, :]))
         return torch.stack(outputs, dim=1)
-
-    def _compute_diversity_penalty(self, factors):
-        if factors.size(0) < 2:
-            return factors.new_tensor(0.0)
-        centered = factors - factors.mean(dim=0, keepdim=True)
-        flat = centered.view(factors.size(0), self.num_experts, -1)
-        gram = torch.einsum("bkd,bjd->kj", flat, flat) / flat.size(0)
-        diag = torch.diag(gram)
-        off_diag = gram - torch.diag_embed(diag)
-        return off_diag.pow(2).sum()
 
     def forward(self, embeddings, attention_mask):
         mask_float = attention_mask.to(dtype=embeddings.dtype)
